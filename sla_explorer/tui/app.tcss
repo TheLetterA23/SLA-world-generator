@@ -1,0 +1,36 @@
+Screen {
+    layout: vertical;
+}
+
+#summary {
+    padding: 1 2;
+    color: $text-muted;
+}
+
+#menu {
+    height: auto;
+    margin: 0 2;
+}
+
+DataTable {
+    height: 1fr;
+}
+
+#chart {
+    height: 1fr;
+    padding: 1 1;
+}
+
+#diagram {
+    height: auto;
+    padding: 1 2;
+}
+
+#legend, #hint, #summary, #overview-body {
+    height: auto;
+    padding: 0 2;
+}
+
+Input {
+    margin: 0 2;
+}
