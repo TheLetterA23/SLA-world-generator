@@ -55,3 +55,6 @@ class Civilization:
 
     def is_at_war_with(self, other: "Civilization") -> bool:
         return self.diplomacy.is_at_war_with(other.id)
+
+    def can_afford(self, cost: ResourceInventory) -> bool:
+        return self.resources.covers(cost)

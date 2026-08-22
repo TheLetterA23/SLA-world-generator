@@ -61,6 +61,15 @@ class ResourceInventory:
             updated[resource] = updated.get(resource, 0.0) + quantity
         return ResourceInventory(updated)
 
+    def subtract(self, other: "ResourceInventory") -> "ResourceInventory":
+        updated = dict(self.amounts)
+        for resource, quantity in other.amounts.items():
+            updated[resource] = max(updated.get(resource, 0.0) - quantity, 0.0)
+        return ResourceInventory(updated)
+
+    def covers(self, other: "ResourceInventory") -> bool:
+        return all(self.amount(resource) >= quantity for resource, quantity in other.amounts.items())
+
     @staticmethod
     def empty() -> "ResourceInventory":
         return ResourceInventory({})
