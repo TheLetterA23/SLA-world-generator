@@ -22,8 +22,10 @@ class UniverseValidator:
         report = ValidationReport()
         system_ids = {system.id for system in universe.systems()}
         planet_ids = {planet.id for planet in universe.planets()}
+        civilization_ids = {civilization.id for civilization in universe.civilizations}
         self._validate_civilizations(universe, system_ids, planet_ids, report)
         self._validate_connections(universe, report)
+        self._validate_wars(universe, civilization_ids, report)
         return report
 
     def _validate_civilizations(self, universe: Universe, system_ids, planet_ids, report: ValidationReport) -> None:
@@ -42,3 +44,10 @@ class UniverseValidator:
             for connection in galaxy.connections.values():
                 if connection.a not in galaxy.systems or connection.b not in galaxy.systems:
                     report.add(f"Connection {connection.id} references a missing system")
+
+    def _validate_wars(self, universe: Universe, civilization_ids: set, report: ValidationReport) -> None:
+        for war in universe.wars.values():
+            if war.attacker_id not in civilization_ids:
+                report.add(f"War {war.id} references a missing attacker")
+            if war.defender_id not in civilization_ids:
+                report.add(f"War {war.id} references a missing defender")

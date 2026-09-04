@@ -2,17 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from sla_world.infrastructure.ids import SystemId, StellarObjectId, CivilizationId
+from sla_world.infrastructure.ids import SystemId, StellarObjectId, CivilizationId, WarId
 from sla_world.domain.galaxy import Galaxy
 from sla_world.domain.system import StarSystem
 from sla_world.domain.planet import Planet
 from sla_world.domain.civilization import Civilization
+from sla_world.domain.war import War
 
 
 @dataclass
 class Universe:
     galaxies: list[Galaxy] = field(default_factory=list)
     civilizations: list[Civilization] = field(default_factory=list)
+    wars: dict[WarId, War] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.reindex()
@@ -37,6 +39,9 @@ class Universe:
 
     def civilization(self, civilization_id: CivilizationId) -> Civilization:
         return self._civilizations_by_id[civilization_id]
+
+    def find_war(self, war_id: WarId) -> War:
+        return self.wars[war_id]
 
     def systems(self) -> list[StarSystem]:
         return list(self._systems_by_id.values())

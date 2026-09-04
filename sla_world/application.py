@@ -5,6 +5,7 @@ from sla_world.domain.galaxy import Galaxy
 from sla_world.domain.system import StarSystem
 from sla_world.domain.planet import Planet
 from sla_world.domain.civilization import Civilization
+from sla_world.domain.war import War
 from sla_world.infrastructure.ids import IdSequence, SystemId, StellarObjectId, CivilizationId
 from sla_world.rules.spreading import SpreadingRateCalculator, ResourceBasedSpreadingRate
 from sla_world.config.simulation import SimulationConfig
@@ -79,6 +80,9 @@ class World:
 
     def spreading_power(self, civilization: Civilization) -> float:
         return self._spreading_rate_calculator.calculate(civilization, self.universe)
+
+    def wars_involving(self, civilization: Civilization) -> list[War]:
+        return [self.universe.find_war(war_id) for war_id in civilization.active_war_ids]
 
     def simulation(self, config: SimulationConfig | None = None) -> SimulationRun:
         config = config or SimulationConfig.standard()

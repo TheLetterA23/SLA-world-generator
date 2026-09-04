@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Mapping
 
-from sla_world.infrastructure.ids import CivilizationId, StellarObjectId, SystemId
+from sla_world.infrastructure.ids import CivilizationId, StellarObjectId, SystemId, WarId
 from sla_world.domain.resources import ResourceInventory
 from sla_world.domain.development import CivilizationDevelopment
 from sla_world.domain.trade import TradeState
@@ -29,15 +30,27 @@ class CivilizationHistory:
         return [event for event in self.events if event.kind == kind]
 
 
+class DiplomaticStance(Enum):
+    NEUTRAL = auto()
+    WAR = auto()
+    ALLIANCE = auto()
+
+
 @dataclass
 class DiplomacyState:
-    relations: dict[CivilizationId, str] = field(default_factory=dict)
+    relations: dict[CivilizationId, DiplomaticStance] = field(default_factory=dict)
 
-    def stance_with(self, other: CivilizationId) -> str:
-        return self.relations.get(other, "neutral")
+    def stance_with(self, other: CivilizationId) -> DiplomaticStance:
+        return self.relations.get(other, DiplomaticStance.NEUTRAL)
 
     def is_at_war_with(self, other: CivilizationId) -> bool:
-        return self.stance_with(other) == "war"
+        return self.stance_with(other) is DiplomaticStance.WAR
+
+    def is_allied_with(self, other: CivilizationId) -> bool:
+        return self.stance_with(other) is DiplomaticStance.ALLIANCE
+
+    def set_stance(self, other: CivilizationId, stance: DiplomaticStance) -> None:
+        self.relations[other] = stance
 
 
 @dataclass
@@ -52,9 +65,13 @@ class Civilization:
     history: CivilizationHistory = field(default_factory=CivilizationHistory)
     diplomacy: DiplomacyState = field(default_factory=DiplomacyState)
     trade: TradeState = field(default_factory=TradeState)
+    active_war_ids: set[WarId] = field(default_factory=set)
 
     def is_at_war_with(self, other: "Civilization") -> bool:
         return self.diplomacy.is_at_war_with(other.id)
+
+    def is_allied_with(self, other: "Civilization") -> bool:
+        return self.diplomacy.is_allied_with(other.id)
 
     def can_afford(self, cost: ResourceInventory) -> bool:
         return self.resources.covers(cost)

@@ -28,6 +28,11 @@ class TradeRouteId:
     value: int
 
 
+@dataclass(frozen=True, slots=True)
+class WarId:
+    value: int
+
+
 class IdSequence:
     def __init__(self, start: int = 1) -> None:
         self._next_value = start

@@ -9,7 +9,7 @@ from rich.text import Text
 
 from sla_world.domain.civilization import Civilization, SimulationEvent
 from sla_world.domain.planet import Planet
-from sla_world.infrastructure.ids import StellarObjectId, SystemId
+from sla_world.infrastructure.ids import StellarObjectId, SystemId, CivilizationId
 from sla_explorer.context import SimulationContext
 
 
@@ -115,7 +115,8 @@ def civilization_overview(context: SimulationContext, civilization: Civilization
     body.append(f"Infrastructure: {civilization.development.infrastructure:.2f}\n")
     body.append(f"Population index: {civilization.development.population:.2f}\n")
     body.append(f"Spreading power: {context.world.spreading_power(civilization):.3f}\n")
-    body.append(f"Active trade routes: {len(civilization.trade.active_routes())}")
+    body.append(f"Active trade routes: {len(civilization.trade.active_routes())}\n")
+    body.append(f"Active wars: {len(civilization.active_war_ids)}")
     return Panel(body, title=f"{civilization.name}  (#{civilization.id.value})")
 
 
@@ -130,6 +131,19 @@ def format_event(context: SimulationContext, event: SimulationEvent) -> str:
         system_id = cast(int, event.data["system_id"])
         system = context.world.find_system(SystemId(system_id))
         return f"claimed system {system.name}"
+    if event.kind == "WarDeclared":
+        defender = context.world.civilization(CivilizationId(cast(int, event.data["defender_id"])))
+        return f"declared war on {defender.name}"
+    if event.kind == "PeaceTreatySigned":
+        opponent = context.world.civilization(CivilizationId(cast(int, event.data["opponent_id"])))
+        return f"signed a peace treaty with {opponent.name}"
+    if event.kind == "AllianceFormed":
+        ally = context.world.civilization(CivilizationId(cast(int, event.data["ally_id"])))
+        return f"formed an alliance with {ally.name}"
+    if event.kind == "SystemCaptured":
+        system = context.world.find_system(SystemId(cast(int, event.data["system_id"])))
+        from_civilization = context.world.civilization(CivilizationId(cast(int, event.data["from_civilization_id"])))
+        return f"captured {system.name} from {from_civilization.name}"
     return event.kind
 
 

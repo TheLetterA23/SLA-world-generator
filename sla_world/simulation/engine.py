@@ -13,6 +13,8 @@ from sla_world.simulation.systems.resource_utilization import ResourceUtilizatio
 from sla_world.simulation.systems.colonization import LocalColonizationHandler
 from sla_world.simulation.systems.exploration import ExplorationHandler
 from sla_world.simulation.systems.development import PlanetaryDevelopmentHandler
+from sla_world.simulation.systems.diplomacy import DiplomacyHandler
+from sla_world.simulation.systems.conquest import WarHandler
 from sla_world.simulation.interstellar.expansion import ExpansionHandler
 from sla_world.simulation.interstellar.trading import TradeRouteHandler
 from sla_world.config.simulation import SimulationConfig
@@ -31,6 +33,8 @@ class SimulationEngine:
                 ResourceUtilizationHandler(),
                 PlanetaryDevelopmentHandler(),
                 LocalColonizationHandler(),
+                DiplomacyHandler(id_sequence),
+                WarHandler(),
                 ExplorationHandler(),
             ],
             interstellar_handlers=[

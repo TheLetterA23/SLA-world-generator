@@ -1,0 +1,939 @@
+From 38eda5d7a2a66d7a6c89f59e0525abe67c0dfd29 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Thu, 3 Sep 2026 19:45:48 +0000
+Subject: [PATCH] Add stellar-tick diplomacy, war, and conquest system
+
+- Add WarId, War domain object, DiplomaticStance enum on DiplomacyState
+- Add Civilization.active_war_ids and Universe.wars index
+- Add rules/diplomacy.py: WarDeclarationPolicy, PeacePolicy, AlliancePolicy
+  with SpreadingPowerWarPolicy, ExhaustionPeacePolicy,
+  SimilarDevelopmentAlliancePolicy defaults
+- Add DiplomacyHandler (stellar): border detection, war declaration,
+  peace resolution, mutual alliance formation
+- Add WarHandler (stellar): per-tick exhaustion growth and probabilistic
+  frontier system capture, tuned for stellar-tick cadence
+  (capture_chance=0.01, exhaustion_per_tick=0.002) rather than the
+  100x-slower interstellar cadence
+- Wire both handlers into SimulationEngine.standard()'s stellar_handlers
+- Add World.wars_involving() facade method
+- Extend UniverseValidator with war referential-integrity checks
+- Add WarDeclared/PeaceTreatySigned/AllianceFormed/SystemCaptured event
+  formatters to sla_explorer render/civilizations.py, plus active war
+  count on the civilization overview panel
+---
+ sla_explorer/render/civilizations.py      | 157 ++++++++++++++++++++++
+ sla_world/application.py                  |  90 +++++++++++++
+ sla_world/domain/civilization.py          |  77 +++++++++++
+ sla_world/domain/universe.py              |  53 ++++++++
+ sla_world/domain/war.py                   |  32 +++++
+ sla_world/infrastructure/ids.py           |  43 ++++++
+ sla_world/rules/consistency.py            |  53 ++++++++
+ sla_world/rules/diplomacy.py              |  50 +++++++
+ sla_world/simulation/engine.py            |  88 ++++++++++++
+ sla_world/simulation/systems/conquest.py  |  53 ++++++++
+ sla_world/simulation/systems/diplomacy.py | 127 +++++++++++++++++
+ 11 files changed, 823 insertions(+)
+ create mode 100644 sla_explorer/render/civilizations.py
+ create mode 100644 sla_world/application.py
+ create mode 100644 sla_world/domain/civilization.py
+ create mode 100644 sla_world/domain/universe.py
+ create mode 100644 sla_world/domain/war.py
+ create mode 100644 sla_world/infrastructure/ids.py
+ create mode 100644 sla_world/rules/consistency.py
+ create mode 100644 sla_world/rules/diplomacy.py
+ create mode 100644 sla_world/simulation/engine.py
+ create mode 100644 sla_world/simulation/systems/conquest.py
+ create mode 100644 sla_world/simulation/systems/diplomacy.py
+
+diff --git a/sla_explorer/render/civilizations.py b/sla_explorer/render/civilizations.py
+new file mode 100644
+index 0000000..2cd0768
+--- /dev/null
++++ b/sla_explorer/render/civilizations.py
+@@ -0,0 +1,157 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import cast
++
++from rich.panel import Panel
++from rich.table import Table
++from rich.text import Text
++
++from sla_world.domain.civilization import Civilization, SimulationEvent
++from sla_world.domain.planet import Planet
++from sla_world.infrastructure.ids import StellarObjectId, SystemId, CivilizationId
++from sla_explorer.context import SimulationContext
++
++
++@dataclass(frozen=True)
++class CivilizationRow:
++    civilization: Civilization
++    system_count: int
++    planet_count: int
++    spreading_power: float
++    technology: float
++
++
++def civilization_rows(context: SimulationContext) -> list[CivilizationRow]:
++    return [
++        CivilizationRow(
++            civilization=civilization,
++            system_count=len(civilization.controlled_system_ids),
++            planet_count=len(civilization.controlled_planet_ids),
++            spreading_power=context.world.spreading_power(civilization),
++            technology=civilization.development.technology,
++        )
++        for civilization in context.civilizations()
++    ]
++
++
++def civilization_table(context: SimulationContext) -> Table:
++    table = Table(title="Civilizations")
++    table.add_column("ID")
++    table.add_column("Name")
++    table.add_column("Systems", justify="right")
++    table.add_column("Planets", justify="right")
++    table.add_column("Tech", justify="right")
++    table.add_column("Spreading Power", justify="right")
++    for row in civilization_rows(context):
++        table.add_row(
++            f"#{row.civilization.id.value}",
++            row.civilization.name,
++            str(row.system_count),
++            str(row.planet_count),
++            f"{row.technology:.2f}",
++            f"{row.spreading_power:.3f}",
++        )
++    return table
++
++
++@dataclass(frozen=True)
++class PlanetRow:
++    planet: Planet
++    system_name: str
++    development_level: float
++
++
++def civilization_planet_rows(context: SimulationContext, civilization: Civilization) -> list[PlanetRow]:
++    rows = []
++    for planet in context.world.controlled_planets(civilization):
++        system_name = "?"
++        if planet.parent_system_id is not None:
++            system_name = context.world.find_system(planet.parent_system_id).name
++        rows.append(PlanetRow(planet=planet, system_name=system_name, development_level=planet.development_level))
++    rows.sort(key=lambda row: row.planet.name)
++    return rows
++
++
++def civilization_planet_table(context: SimulationContext, civilization: Civilization) -> Table:
++    table = Table(title=f"Planets controlled by {civilization.name}")
++    table.add_column("Planet")
++    table.add_column("System")
++    table.add_column("Type")
++    table.add_column("Habitability", justify="right")
++    table.add_column("Development", justify="right")
++    for row in civilization_planet_rows(context, civilization):
++        table.add_row(
++            row.planet.name,
++            row.system_name,
++            row.planet.planet_type.name.replace("_", " ").title(),
++            f"{row.planet.habitability.base_score:.2f}",
++            f"{row.development_level:.2f}",
++        )
++    return table
++
++
++def civilization_systems_table(context: SimulationContext, civilization: Civilization) -> Table:
++    table = Table(title=f"Systems controlled by {civilization.name}")
++    table.add_column("System")
++    table.add_column("Owned / Total planets")
++    table.add_column("Position")
++    for system in context.world.controlled_systems(civilization):
++        owned = sum(1 for planet in system.planets() if planet.owner == civilization.id)
++        table.add_row(
++            system.name,
++            f"{owned}/{len(system.planets())}",
++            f"({system.position.x:.0f}, {system.position.y:.0f}, {system.position.z:.0f})",
++        )
++    return table
++
++
++def civilization_overview(context: SimulationContext, civilization: Civilization) -> Panel:
++    origin = context.world.origin_world(civilization)
++    body = Text()
++    body.append(f"Origin world: {origin.name} (habitability {origin.habitability.base_score:.2f})\n")
++    body.append(f"Technology: {civilization.development.technology:.2f}\n")
++    body.append(f"Industrialization: {civilization.development.industrialization:.2f}\n")
++    body.append(f"Infrastructure: {civilization.development.infrastructure:.2f}\n")
++    body.append(f"Population index: {civilization.development.population:.2f}\n")
++    body.append(f"Spreading power: {context.world.spreading_power(civilization):.3f}\n")
++    body.append(f"Active trade routes: {len(civilization.trade.active_routes())}\n")
++    body.append(f"Active wars: {len(civilization.active_war_ids)}")
++    return Panel(body, title=f"{civilization.name}  (#{civilization.id.value})")
++
++
++def format_event(context: SimulationContext, event: SimulationEvent) -> str:
++    if event.kind == "PlanetColonized":
++        planet_id = cast(int, event.data["planet_id"])
++        system_id = cast(int, event.data["system_id"])
++        planet = context.world.find_planet(StellarObjectId(planet_id))
++        system = context.world.find_system(SystemId(system_id))
++        return f"colonized {planet.name} in system {system.name}"
++    if event.kind == "SystemClaimed":
++        system_id = cast(int, event.data["system_id"])
++        system = context.world.find_system(SystemId(system_id))
++        return f"claimed system {system.name}"
++    if event.kind == "WarDeclared":
++        defender = context.world.civilization(CivilizationId(cast(int, event.data["defender_id"])))
++        return f"declared war on {defender.name}"
++    if event.kind == "PeaceTreatySigned":
++        opponent = context.world.civilization(CivilizationId(cast(int, event.data["opponent_id"])))
++        return f"signed a peace treaty with {opponent.name}"
++    if event.kind == "AllianceFormed":
++        ally = context.world.civilization(CivilizationId(cast(int, event.data["ally_id"])))
++        return f"formed an alliance with {ally.name}"
++    if event.kind == "SystemCaptured":
++        system = context.world.find_system(SystemId(cast(int, event.data["system_id"])))
++        from_civilization = context.world.civilization(CivilizationId(cast(int, event.data["from_civilization_id"])))
++        return f"captured {system.name} from {from_civilization.name}"
++    return event.kind
++
++
++def civilization_history_table(context: SimulationContext, civilization: Civilization) -> Table:
++    table = Table(title=f"History of {civilization.name}")
++    table.add_column("Time", justify="right")
++    table.add_column("Event")
++    table.add_column("Details")
++    for event in sorted(civilization.history.events, key=lambda event: event.time):
++        table.add_row(str(event.time), event.kind, format_event(context, event))
++    return table
+diff --git a/sla_world/application.py b/sla_world/application.py
+new file mode 100644
+index 0000000..4ed8510
+--- /dev/null
++++ b/sla_world/application.py
+@@ -0,0 +1,90 @@
++from __future__ import annotations
++
++from sla_world.domain.universe import Universe
++from sla_world.domain.galaxy import Galaxy
++from sla_world.domain.system import StarSystem
++from sla_world.domain.planet import Planet
++from sla_world.domain.civilization import Civilization
++from sla_world.domain.war import War
++from sla_world.infrastructure.ids import IdSequence, SystemId, StellarObjectId, CivilizationId
++from sla_world.rules.spreading import SpreadingRateCalculator, ResourceBasedSpreadingRate
++from sla_world.config.simulation import SimulationConfig
++from sla_world.simulation.engine import SimulationEngine, SimulationRun
++from sla_world.procedural.planet_details import PlanetDetailGenerator, PlanetDetails, DetailLevel
++from sla_world.procedural.traffic import TrafficEstimator, TrafficProfile
++
++
++class DetailServices:
++    def __init__(
++        self,
++        universe: Universe,
++        planet_detail_generator: PlanetDetailGenerator | None = None,
++        traffic_estimator: TrafficEstimator | None = None,
++    ) -> None:
++        self._universe = universe
++        self._planet_detail_generator = planet_detail_generator or PlanetDetailGenerator()
++        self._traffic_estimator = traffic_estimator or TrafficEstimator()
++
++    def for_planet(self, planet: Planet, detail_level: DetailLevel = DetailLevel.STANDARD) -> PlanetDetails:
++        civilization = self._universe.civilization(planet.owner) if planet.owner is not None else None
++        return self._planet_detail_generator.generate(planet, civilization, detail_level)
++
++    def traffic_for(self, system: StarSystem) -> TrafficProfile:
++        return self._traffic_estimator.estimate(system, self._universe)
++
++
++class World:
++    def __init__(
++        self,
++        universe: Universe,
++        id_sequence: IdSequence,
++        seed: int,
++        spreading_rate_calculator: SpreadingRateCalculator | None = None,
++    ) -> None:
++        self.universe = universe
++        self.id_sequence = id_sequence
++        self.seed = seed
++        self._spreading_rate_calculator = spreading_rate_calculator or ResourceBasedSpreadingRate()
++        self.details = DetailServices(universe)
++
++    @property
++    def galaxy(self) -> Galaxy:
++        return self.universe.galaxy()
++
++    def systems(self) -> list[StarSystem]:
++        return self.universe.systems()
++
++    def planets(self) -> list[Planet]:
++        return self.universe.planets()
++
++    def civilizations(self) -> list[Civilization]:
++        return self.universe.civilizations
++
++    def find_system(self, system_id: SystemId) -> StarSystem:
++        return self.universe.find_system(system_id)
++
++    def find_planet(self, planet_id: StellarObjectId) -> Planet:
++        return self.universe.find_planet(planet_id)
++
++    def civilization(self, civilization_id: CivilizationId) -> Civilization:
++        return self.universe.civilization(civilization_id)
++
++    def controlled_systems(self, civilization: Civilization) -> list[StarSystem]:
++        return [self.universe.find_system(system_id) for system_id in civilization.controlled_system_ids]
++
++    def controlled_planets(self, civilization: Civilization) -> list[Planet]:
++        return [self.universe.find_planet(planet_id) for planet_id in civilization.controlled_planet_ids]
++
++    def origin_world(self, civilization: Civilization) -> Planet:
++        return self.universe.find_planet(civilization.origin_world_id)
++
++    def spreading_power(self, civilization: Civilization) -> float:
++        return self._spreading_rate_calculator.calculate(civilization, self.universe)
++
++    def wars_involving(self, civilization: Civilization) -> list[War]:
++        return [self.universe.find_war(war_id) for war_id in civilization.active_war_ids]
++
++    def simulation(self, config: SimulationConfig | None = None) -> SimulationRun:
++        config = config or SimulationConfig.standard()
++        engine = SimulationEngine.standard(self.id_sequence)
++        return SimulationRun(engine=engine, universe=self.universe, config=config, seed=self.seed)
+diff --git a/sla_world/domain/civilization.py b/sla_world/domain/civilization.py
+new file mode 100644
+index 0000000..728c588
+--- /dev/null
++++ b/sla_world/domain/civilization.py
+@@ -0,0 +1,77 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum, auto
++from typing import Mapping
++
++from sla_world.infrastructure.ids import CivilizationId, StellarObjectId, SystemId, WarId
++from sla_world.domain.resources import ResourceInventory
++from sla_world.domain.development import CivilizationDevelopment
++from sla_world.domain.trade import TradeState
++from sla_world.domain.values import SimulationTime
++
++
++@dataclass(frozen=True, slots=True)
++class SimulationEvent:
++    time: SimulationTime
++    kind: str
++    actor_id: str
++    data: Mapping[str, object] = field(default_factory=dict)
++
++
++@dataclass
++class CivilizationHistory:
++    events: list[SimulationEvent] = field(default_factory=list)
++
++    def record(self, event: SimulationEvent) -> None:
++        self.events.append(event)
++
++    def events_of_kind(self, kind: str) -> list[SimulationEvent]:
++        return [event for event in self.events if event.kind == kind]
++
++
++class DiplomaticStance(Enum):
++    NEUTRAL = auto()
++    WAR = auto()
++    ALLIANCE = auto()
++
++
++@dataclass
++class DiplomacyState:
++    relations: dict[CivilizationId, DiplomaticStance] = field(default_factory=dict)
++
++    def stance_with(self, other: CivilizationId) -> DiplomaticStance:
++        return self.relations.get(other, DiplomaticStance.NEUTRAL)
++
++    def is_at_war_with(self, other: CivilizationId) -> bool:
++        return self.stance_with(other) is DiplomaticStance.WAR
++
++    def is_allied_with(self, other: CivilizationId) -> bool:
++        return self.stance_with(other) is DiplomaticStance.ALLIANCE
++
++    def set_stance(self, other: CivilizationId, stance: DiplomaticStance) -> None:
++        self.relations[other] = stance
++
++
++@dataclass
++class Civilization:
++    id: CivilizationId
++    name: str
++    origin_world_id: StellarObjectId
++    controlled_system_ids: set[SystemId] = field(default_factory=set)
++    controlled_planet_ids: set[StellarObjectId] = field(default_factory=set)
++    resources: ResourceInventory = field(default_factory=ResourceInventory.empty)
++    development: CivilizationDevelopment = field(default_factory=CivilizationDevelopment)
++    history: CivilizationHistory = field(default_factory=CivilizationHistory)
++    diplomacy: DiplomacyState = field(default_factory=DiplomacyState)
++    trade: TradeState = field(default_factory=TradeState)
++    active_war_ids: set[WarId] = field(default_factory=set)
++
++    def is_at_war_with(self, other: "Civilization") -> bool:
++        return self.diplomacy.is_at_war_with(other.id)
++
++    def is_allied_with(self, other: "Civilization") -> bool:
++        return self.diplomacy.is_allied_with(other.id)
++
++    def can_afford(self, cost: ResourceInventory) -> bool:
++        return self.resources.covers(cost)
+diff --git a/sla_world/domain/universe.py b/sla_world/domain/universe.py
+new file mode 100644
+index 0000000..973011f
+--- /dev/null
++++ b/sla_world/domain/universe.py
+@@ -0,0 +1,53 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++from sla_world.infrastructure.ids import SystemId, StellarObjectId, CivilizationId, WarId
++from sla_world.domain.galaxy import Galaxy
++from sla_world.domain.system import StarSystem
++from sla_world.domain.planet import Planet
++from sla_world.domain.civilization import Civilization
++from sla_world.domain.war import War
++
++
++@dataclass
++class Universe:
++    galaxies: list[Galaxy] = field(default_factory=list)
++    civilizations: list[Civilization] = field(default_factory=list)
++    wars: dict[WarId, War] = field(default_factory=dict)
++
++    def __post_init__(self) -> None:
++        self.reindex()
++
++    def reindex(self) -> None:
++        self._systems_by_id: dict[SystemId, StarSystem] = {}
++        self._planets_by_id: dict[StellarObjectId, Planet] = {}
++        self._civilizations_by_id: dict[CivilizationId, Civilization] = {}
++        for galaxy in self.galaxies:
++            for system in galaxy.all_systems():
++                self._systems_by_id[system.id] = system
++                for planet in system.planets():
++                    self._planets_by_id[planet.id] = planet
++        for civilization in self.civilizations:
++            self._civilizations_by_id[civilization.id] = civilization
++
++    def find_system(self, system_id: SystemId) -> StarSystem:
++        return self._systems_by_id[system_id]
++
++    def find_planet(self, planet_id: StellarObjectId) -> Planet:
++        return self._planets_by_id[planet_id]
++
++    def civilization(self, civilization_id: CivilizationId) -> Civilization:
++        return self._civilizations_by_id[civilization_id]
++
++    def find_war(self, war_id: WarId) -> War:
++        return self.wars[war_id]
++
++    def systems(self) -> list[StarSystem]:
++        return list(self._systems_by_id.values())
++
++    def planets(self) -> list[Planet]:
++        return list(self._planets_by_id.values())
++
++    def galaxy(self) -> Galaxy:
++        return self.galaxies[0]
+diff --git a/sla_world/domain/war.py b/sla_world/domain/war.py
+new file mode 100644
+index 0000000..f77d0f2
+--- /dev/null
++++ b/sla_world/domain/war.py
+@@ -0,0 +1,32 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from sla_world.infrastructure.ids import WarId, CivilizationId
++from sla_world.domain.values import SimulationTime
++
++
++@dataclass
++class War:
++    id: WarId
++    attacker_id: CivilizationId
++    defender_id: CivilizationId
++    started_at: SimulationTime
++    attacker_exhaustion: float = 0.0
++    defender_exhaustion: float = 0.0
++    active: bool = True
++
++    def involves(self, civilization_id: CivilizationId) -> bool:
++        return civilization_id in (self.attacker_id, self.defender_id)
++
++    def opponent_of(self, civilization_id: CivilizationId) -> CivilizationId:
++        return self.defender_id if civilization_id == self.attacker_id else self.attacker_id
++
++    def exhaustion_for(self, civilization_id: CivilizationId) -> float:
++        return self.attacker_exhaustion if civilization_id == self.attacker_id else self.defender_exhaustion
++
++    def add_exhaustion(self, civilization_id: CivilizationId, amount: float) -> None:
++        if civilization_id == self.attacker_id:
++            self.attacker_exhaustion += amount
++        else:
++            self.defender_exhaustion += amount
+diff --git a/sla_world/infrastructure/ids.py b/sla_world/infrastructure/ids.py
+new file mode 100644
+index 0000000..6ca2272
+--- /dev/null
++++ b/sla_world/infrastructure/ids.py
+@@ -0,0 +1,43 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True, slots=True)
++class SystemId:
++    value: int
++
++
++@dataclass(frozen=True, slots=True)
++class StellarObjectId:
++    value: int
++
++
++@dataclass(frozen=True, slots=True)
++class ConnectionId:
++    value: int
++
++
++@dataclass(frozen=True, slots=True)
++class CivilizationId:
++    value: int
++
++
++@dataclass(frozen=True, slots=True)
++class TradeRouteId:
++    value: int
++
++
++@dataclass(frozen=True, slots=True)
++class WarId:
++    value: int
++
++
++class IdSequence:
++    def __init__(self, start: int = 1) -> None:
++        self._next_value = start
++
++    def next(self) -> int:
++        value = self._next_value
++        self._next_value += 1
++        return value
+diff --git a/sla_world/rules/consistency.py b/sla_world/rules/consistency.py
+new file mode 100644
+index 0000000..3c652e6
+--- /dev/null
++++ b/sla_world/rules/consistency.py
+@@ -0,0 +1,53 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++from sla_world.domain.universe import Universe
++
++
++@dataclass
++class ValidationReport:
++    issues: list[str] = field(default_factory=list)
++
++    @property
++    def is_valid(self) -> bool:
++        return not self.issues
++
++    def add(self, issue: str) -> None:
++        self.issues.append(issue)
++
++
++class UniverseValidator:
++    def validate(self, universe: Universe) -> ValidationReport:
++        report = ValidationReport()
++        system_ids = {system.id for system in universe.systems()}
++        planet_ids = {planet.id for planet in universe.planets()}
++        civilization_ids = {civilization.id for civilization in universe.civilizations}
++        self._validate_civilizations(universe, system_ids, planet_ids, report)
++        self._validate_connections(universe, report)
++        self._validate_wars(universe, civilization_ids, report)
++        return report
++
++    def _validate_civilizations(self, universe: Universe, system_ids, planet_ids, report: ValidationReport) -> None:
++        for civilization in universe.civilizations:
++            if civilization.origin_world_id not in planet_ids:
++                report.add(f"Civilization {civilization.name} has a missing origin world")
++            for system_id in civilization.controlled_system_ids:
++                if system_id not in system_ids:
++                    report.add(f"Civilization {civilization.name} controls a missing system {system_id}")
++            for planet_id in civilization.controlled_planet_ids:
++                if planet_id not in planet_ids:
++                    report.add(f"Civilization {civilization.name} controls a missing planet {planet_id}")
++
++    def _validate_connections(self, universe: Universe, report: ValidationReport) -> None:
++        for galaxy in universe.galaxies:
++            for connection in galaxy.connections.values():
++                if connection.a not in galaxy.systems or connection.b not in galaxy.systems:
++                    report.add(f"Connection {connection.id} references a missing system")
++
++    def _validate_wars(self, universe: Universe, civilization_ids: set, report: ValidationReport) -> None:
++        for war in universe.wars.values():
++            if war.attacker_id not in civilization_ids:
++                report.add(f"War {war.id} references a missing attacker")
++            if war.defender_id not in civilization_ids:
++                report.add(f"War {war.id} references a missing defender")
+diff --git a/sla_world/rules/diplomacy.py b/sla_world/rules/diplomacy.py
+new file mode 100644
+index 0000000..eecdd18
+--- /dev/null
++++ b/sla_world/rules/diplomacy.py
+@@ -0,0 +1,50 @@
++from __future__ import annotations
++
++from typing import Protocol
++
++from sla_world.domain.civilization import Civilization
++from sla_world.domain.war import War
++from sla_world.domain.universe import Universe
++from sla_world.rules.spreading import SpreadingRateCalculator, ResourceBasedSpreadingRate
++
++
++class WarDeclarationPolicy(Protocol):
++    def should_declare_war(self, civilization: Civilization, other: Civilization, universe: Universe) -> bool: ...
++
++
++class PeacePolicy(Protocol):
++    def should_seek_peace(self, civilization: Civilization, war: War, universe: Universe) -> bool: ...
++
++
++class AlliancePolicy(Protocol):
++    def should_propose_alliance(self, civilization: Civilization, other: Civilization, universe: Universe) -> bool: ...
++
++
++class SpreadingPowerWarPolicy:
++    def __init__(
++        self, spreading_rate_calculator: SpreadingRateCalculator | None = None, aggression_ratio: float = 1.5
++    ) -> None:
++        self._spreading_rate_calculator = spreading_rate_calculator or ResourceBasedSpreadingRate()
++        self._aggression_ratio = aggression_ratio
++
++    def should_declare_war(self, civilization: Civilization, other: Civilization, universe: Universe) -> bool:
++        own_power = self._spreading_rate_calculator.calculate(civilization, universe)
++        their_power = self._spreading_rate_calculator.calculate(other, universe)
++        return own_power > their_power * self._aggression_ratio
++
++
++class ExhaustionPeacePolicy:
++    def __init__(self, exhaustion_threshold: float = 0.7) -> None:
++        self._exhaustion_threshold = exhaustion_threshold
++
++    def should_seek_peace(self, civilization: Civilization, war: War, universe: Universe) -> bool:
++        return war.exhaustion_for(civilization.id) >= self._exhaustion_threshold
++
++
++class SimilarDevelopmentAlliancePolicy:
++    def __init__(self, similarity_tolerance: float = 0.2) -> None:
++        self._similarity_tolerance = similarity_tolerance
++
++    def should_propose_alliance(self, civilization: Civilization, other: Civilization, universe: Universe) -> bool:
++        difference = abs(civilization.development.overall_score() - other.development.overall_score())
++        return difference <= self._similarity_tolerance
+diff --git a/sla_world/simulation/engine.py b/sla_world/simulation/engine.py
+new file mode 100644
+index 0000000..54ad44b
+--- /dev/null
++++ b/sla_world/simulation/engine.py
+@@ -0,0 +1,88 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++from sla_world.domain.universe import Universe
++from sla_world.domain.values import SimulationTime
++from sla_world.infrastructure.ids import IdSequence
++from sla_world.infrastructure.random import RandomStreams, SeededRandom
++from sla_world.simulation.clock import SimulationClock
++from sla_world.simulation.context import StellarTickContext, InterstellarTickContext
++from sla_world.simulation.ticks import StellarTickHandler, InterstellarTickHandler
++from sla_world.simulation.systems.resource_utilization import ResourceUtilizationHandler
++from sla_world.simulation.systems.colonization import LocalColonizationHandler
++from sla_world.simulation.systems.exploration import ExplorationHandler
++from sla_world.simulation.systems.development import PlanetaryDevelopmentHandler
++from sla_world.simulation.systems.diplomacy import DiplomacyHandler
++from sla_world.simulation.systems.conquest import WarHandler
++from sla_world.simulation.interstellar.expansion import ExpansionHandler
++from sla_world.simulation.interstellar.trading import TradeRouteHandler
++from sla_world.config.simulation import SimulationConfig
++from sla_world.rules.consistency import UniverseValidator
++
++
++@dataclass
++class SimulationEngine:
++    stellar_handlers: list[StellarTickHandler] = field(default_factory=list)
++    interstellar_handlers: list[InterstellarTickHandler] = field(default_factory=list)
++
++    @staticmethod
++    def standard(id_sequence: IdSequence) -> "SimulationEngine":
++        return SimulationEngine(
++            stellar_handlers=[
++                ResourceUtilizationHandler(),
++                PlanetaryDevelopmentHandler(),
++                LocalColonizationHandler(),
++                DiplomacyHandler(id_sequence),
++                WarHandler(),
++                ExplorationHandler(),
++            ],
++            interstellar_handlers=[
++                ExpansionHandler(),
++                TradeRouteHandler(id_sequence),
++            ],
++        )
++
++    def step_stellar(self, universe: Universe, clock: SimulationClock, rng: SeededRandom) -> None:
++        context = StellarTickContext(universe=universe, clock=clock, rng=rng)
++        for handler in self.stellar_handlers:
++            handler.execute(context)
++
++    def step_interstellar(self, universe: Universe, clock: SimulationClock, rng: SeededRandom) -> None:
++        context = InterstellarTickContext(universe=universe, clock=clock, rng=rng)
++        for handler in self.interstellar_handlers:
++            handler.execute(context)
++
++
++class SimulationRun:
++    def __init__(self, engine: SimulationEngine, universe: Universe, config: SimulationConfig, seed: int) -> None:
++        self._engine = engine
++        self._universe = universe
++        self._config = config
++        self._validator = UniverseValidator() if config.validate_after_tick else None
++        self.clock = SimulationClock(
++            current_time=SimulationTime(0),
++            stellar_interval=config.stellar_tick_length,
++            interstellar_interval=config.interstellar_tick_length,
++        )
++        streams = RandomStreams(seed)
++        self._stellar_rng = streams.stream("simulation.stellar")
++        self._interstellar_rng = streams.stream("simulation.interstellar")
++
++    def run(self, until: int) -> None:
++        steps_per_interstellar = max(1, self._config.interstellar_tick_length // self._config.stellar_tick_length)
++        step_index = 0
++        while self.clock.current_time < until:
++            self._engine.step_stellar(self._universe, self.clock, self._stellar_rng)
++            self.clock.advance_stellar()
++            step_index += 1
++            if step_index % steps_per_interstellar == 0:
++                self._engine.step_interstellar(self._universe, self.clock, self._interstellar_rng)
++            self._validate_if_configured()
++
++    def _validate_if_configured(self) -> None:
++        if self._validator is None:
++            return
++        report = self._validator.validate(self._universe)
++        if not report.is_valid:
++            raise RuntimeError(f"Universe invariants violated at time {self.clock.current_time}: {report.issues}")
+diff --git a/sla_world/simulation/systems/conquest.py b/sla_world/simulation/systems/conquest.py
+new file mode 100644
+index 0000000..6cf1840
+--- /dev/null
++++ b/sla_world/simulation/systems/conquest.py
+@@ -0,0 +1,53 @@
++from __future__ import annotations
++
++from sla_world.simulation.context import StellarTickContext
++from sla_world.domain.civilization import Civilization, SimulationEvent
++from sla_world.domain.system import StarSystem
++from sla_world.domain.universe import Universe
++from sla_world.domain.war import War
++from sla_world.infrastructure.ids import SystemId
++
++
++class WarHandler:
++    def __init__(self, capture_chance: float = 0.01, exhaustion_per_tick: float = 0.002) -> None:
++        self._capture_chance = capture_chance
++        self._exhaustion_per_tick = exhaustion_per_tick
++
++    def execute(self, context: StellarTickContext) -> None:
++        for war in list(context.universe.wars.values()):
++            if not war.active:
++                continue
++            war.add_exhaustion(war.attacker_id, self._exhaustion_per_tick)
++            war.add_exhaustion(war.defender_id, self._exhaustion_per_tick)
++            self._attempt_captures(war, context)
++
++    def _attempt_captures(self, war: War, context: StellarTickContext) -> None:
++        attacker = context.universe.civilization(war.attacker_id)
++        defender = context.universe.civilization(war.defender_id)
++        for owner, enemy in ((attacker, defender), (defender, attacker)):
++            frontier = self._enemy_frontier_systems(owner, enemy, context.universe)
++            if not frontier or context.rng.random() > self._capture_chance:
++                continue
++            self._capture(context.rng.choice(frontier), owner, enemy, context)
++
++    def _enemy_frontier_systems(self, owner: Civilization, enemy: Civilization, universe: Universe) -> list[StarSystem]:
++        galaxy = universe.galaxy()
++        frontier: dict[SystemId, StarSystem] = {}
++        for system_id in owner.controlled_system_ids:
++            for neighbor in galaxy.neighbors(universe.find_system(system_id)):
++                if neighbor.controlled_by == enemy.id:
++                    frontier[neighbor.id] = neighbor
++        return list(frontier.values())
++
++    def _capture(self, system: StarSystem, owner: Civilization, enemy: Civilization, context: StellarTickContext) -> None:
++        enemy.controlled_system_ids.discard(system.id)
++        owner.controlled_system_ids.add(system.id)
++        system.controlled_by = owner.id
++        owner.history.record(
++            SimulationEvent(
++                time=context.clock.current_time,
++                kind="SystemCaptured",
++                actor_id=str(owner.id.value),
++                data={"system_id": system.id.value, "from_civilization_id": enemy.id.value},
++            )
++        )
+diff --git a/sla_world/simulation/systems/diplomacy.py b/sla_world/simulation/systems/diplomacy.py
+new file mode 100644
+index 0000000..edbdde1
+--- /dev/null
++++ b/sla_world/simulation/systems/diplomacy.py
+@@ -0,0 +1,127 @@
++from __future__ import annotations
++
++from sla_world.simulation.context import StellarTickContext
++from sla_world.infrastructure.ids import IdSequence, WarId, CivilizationId
++from sla_world.domain.civilization import Civilization, DiplomaticStance, SimulationEvent
++from sla_world.domain.universe import Universe
++from sla_world.domain.war import War
++from sla_world.rules.diplomacy import (
++    WarDeclarationPolicy,
++    PeacePolicy,
++    AlliancePolicy,
++    SpreadingPowerWarPolicy,
++    ExhaustionPeacePolicy,
++    SimilarDevelopmentAlliancePolicy,
++)
++
++
++class DiplomacyHandler:
++    def __init__(
++        self,
++        id_sequence: IdSequence,
++        war_declaration_policy: WarDeclarationPolicy | None = None,
++        peace_policy: PeacePolicy | None = None,
++        alliance_policy: AlliancePolicy | None = None,
++    ) -> None:
++        self._id_sequence = id_sequence
++        self._war_declaration_policy = war_declaration_policy or SpreadingPowerWarPolicy()
++        self._peace_policy = peace_policy or ExhaustionPeacePolicy()
++        self._alliance_policy = alliance_policy or SimilarDevelopmentAlliancePolicy()
++
++    def execute(self, context: StellarTickContext) -> None:
++        self._resolve_peace(context)
++        self._declare_wars(context)
++        self._form_alliances(context)
++
++    def _bordering_civilizations(self, civilization: Civilization, universe: Universe) -> set[CivilizationId]:
++        galaxy = universe.galaxy()
++        borders: set[CivilizationId] = set()
++        for system_id in civilization.controlled_system_ids:
++            for neighbor in galaxy.neighbors(universe.find_system(system_id)):
++                if neighbor.controlled_by is not None and neighbor.controlled_by != civilization.id:
++                    borders.add(neighbor.controlled_by)
++        return borders
++
++    def _declare_wars(self, context: StellarTickContext) -> None:
++        for civilization in context.universe.civilizations:
++            for border_id in self._bordering_civilizations(civilization, context.universe):
++                other = context.universe.civilization(border_id)
++                if civilization.diplomacy.stance_with(other.id) is not DiplomaticStance.NEUTRAL:
++                    continue
++                if not self._war_declaration_policy.should_declare_war(civilization, other, context.universe):
++                    continue
++                self._start_war(civilization, other, context)
++
++    def _start_war(self, attacker: Civilization, defender: Civilization, context: StellarTickContext) -> None:
++        war = War(
++            id=WarId(self._id_sequence.next()),
++            attacker_id=attacker.id,
++            defender_id=defender.id,
++            started_at=context.clock.current_time,
++        )
++        context.universe.wars[war.id] = war
++        attacker.active_war_ids.add(war.id)
++        defender.active_war_ids.add(war.id)
++        attacker.diplomacy.set_stance(defender.id, DiplomaticStance.WAR)
++        defender.diplomacy.set_stance(attacker.id, DiplomaticStance.WAR)
++        attacker.history.record(
++            SimulationEvent(
++                time=context.clock.current_time,
++                kind="WarDeclared",
++                actor_id=str(attacker.id.value),
++                data={"defender_id": defender.id.value, "war_id": war.id.value},
++            )
++        )
++
++    def _resolve_peace(self, context: StellarTickContext) -> None:
++        for war in list(context.universe.wars.values()):
++            if not war.active:
++                continue
++            attacker = context.universe.civilization(war.attacker_id)
++            defender = context.universe.civilization(war.defender_id)
++            attacker_wants_peace = self._peace_policy.should_seek_peace(attacker, war, context.universe)
++            defender_wants_peace = self._peace_policy.should_seek_peace(defender, war, context.universe)
++            if not (attacker_wants_peace or defender_wants_peace):
++                continue
++            self._end_war(war, attacker, defender, context)
++
++    def _end_war(self, war: War, attacker: Civilization, defender: Civilization, context: StellarTickContext) -> None:
++        war.active = False
++        attacker.active_war_ids.discard(war.id)
++        defender.active_war_ids.discard(war.id)
++        attacker.diplomacy.set_stance(defender.id, DiplomaticStance.NEUTRAL)
++        defender.diplomacy.set_stance(attacker.id, DiplomaticStance.NEUTRAL)
++        for civilization, opponent in ((attacker, defender), (defender, attacker)):
++            civilization.history.record(
++                SimulationEvent(
++                    time=context.clock.current_time,
++                    kind="PeaceTreatySigned",
++                    actor_id=str(civilization.id.value),
++                    data={"opponent_id": opponent.id.value, "war_id": war.id.value},
++                )
++            )
++
++    def _form_alliances(self, context: StellarTickContext) -> None:
++        for civilization in context.universe.civilizations:
++            for border_id in self._bordering_civilizations(civilization, context.universe):
++                other = context.universe.civilization(border_id)
++                if civilization.diplomacy.stance_with(other.id) is not DiplomaticStance.NEUTRAL:
++                    continue
++                if not self._alliance_policy.should_propose_alliance(civilization, other, context.universe):
++                    continue
++                if not self._alliance_policy.should_propose_alliance(other, civilization, context.universe):
++                    continue
++                self._form_alliance(civilization, other, context)
++
++    def _form_alliance(self, first: Civilization, second: Civilization, context: StellarTickContext) -> None:
++        first.diplomacy.set_stance(second.id, DiplomaticStance.ALLIANCE)
++        second.diplomacy.set_stance(first.id, DiplomaticStance.ALLIANCE)
++        for civilization, ally in ((first, second), (second, first)):
++            civilization.history.record(
++                SimulationEvent(
++                    time=context.clock.current_time,
++                    kind="AllianceFormed",
++                    actor_id=str(civilization.id.value),
++                    data={"ally_id": ally.id.value},
++                )
++            )
+-- 
+2.43.0
+
