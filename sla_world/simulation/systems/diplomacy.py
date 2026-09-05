@@ -69,9 +69,17 @@ class DiplomacyHandler:
                 time=context.clock.current_time,
                 kind="WarDeclared",
                 actor_id=str(attacker.id.value),
-                data={"defender_id": defender.id.value, "war_id": war.id.value},
+                data={"defender_id": defender.id.value, "attacker_id": attacker.id.value, "war_id": war.id.value},
             )
         )
+        defender.history.record(
+                    SimulationEvent(
+                        time=context.clock.current_time,
+                        kind="WarDeclared",
+                        actor_id=str(attacker.id.value),
+                        data={"defender_id": defender.id.value, "attacker_id": attacker.id.value, "war_id": war.id.value},
+                    )
+                )
 
     def _resolve_peace(self, context: StellarTickContext) -> None:
         for war in list(context.universe.wars.values()):

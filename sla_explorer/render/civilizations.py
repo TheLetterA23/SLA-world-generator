@@ -133,7 +133,8 @@ def format_event(context: SimulationContext, event: SimulationEvent) -> str:
         return f"claimed system {system.name}"
     if event.kind == "WarDeclared":
         defender = context.world.civilization(CivilizationId(cast(int, event.data["defender_id"])))
-        return f"declared war on {defender.name}"
+        attacker = context.world.civilization(CivilizationId(cast(int, event.data["attacker_id"])))
+        return f"declared war on {defender.name} by {attacker.name}"
     if event.kind == "PeaceTreatySigned":
         opponent = context.world.civilization(CivilizationId(cast(int, event.data["opponent_id"])))
         return f"signed a peace treaty with {opponent.name}"
